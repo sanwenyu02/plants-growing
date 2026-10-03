@@ -1,0 +1,770 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Plant Loading</title>
+<style>
+  :root { --ink: #161512; --muted: #8b8679; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body {
+    background: radial-gradient(ellipse at 50% 45%, #f8f6f0 0%, #f1eee6 55%, #e4dfd2 100%);
+    color: var(--ink);
+    font-family: "Helvetica Neue", Arial, sans-serif;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  .hud { position: fixed; left: 0; right: 0; bottom: 6vh; text-align: center; pointer-events: none; }
+  .name { opacity: 0; transform: translateY(6px); transition: opacity .6s ease, transform .6s ease; min-height: 52px; }
+  .name.show { opacity: 1; transform: none; }
+  .zh { font-family: "Noto Serif SC", "Songti SC", "STSong", "SimSun", serif; font-size: 20px; letter-spacing: .4em; padding-left: .4em; }
+  .latin { font-family: Georgia, serif; font-style: italic; font-size: 12px; letter-spacing: .08em; color: var(--muted); margin-top: 6px; }
+  .bar { width: 160px; height: 1px; background: rgba(22,21,18,.12); margin: 18px auto 10px; position: relative; overflow: hidden; }
+  .bar i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--ink); transition: width .3s linear; }
+  .status { font-size: 10px; letter-spacing: .45em; padding-left: .45em; color: var(--muted); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud">
+  <div class="name" id="name"><div class="zh" id="zh"></div><div class="latin" id="latin"></div></div>
+  <div class="bar"><i id="bar"></i></div>
+  <div class="status" id="status">LOADING 0%</div>
+</div>
+<script>
+(() => {
+// ================= 可调参数 =================
+const DUR = [1.0, 1.0, 1.0, 1.0]; // 自由流动 / 聚合成形 / 维持 / 散开（秒）
+const PLANT_FRACTION = 0.85;      // 参与组成植物的粒子比例，其余继续在外面飘
+let ROT_SPEED = 0.35;            // 植物绕 Y 轴旋转速度（弧度/秒），产生立体感
+const TILT = 0.2;                 // 俯视角
+const CAM = 4.2;                  // 透视相机距离
+const WIND_AMP = 1.15;            // 风速
+const NOISE_SCALE = 1 / 240;      // 风场尺度
+
+// ================= 数学工具 =================
+const TAU = Math.PI * 2, R = Math.random;
+const rnd = (a, b) => a + R() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const vlen = a => Math.hypot(a[0], a[1], a[2]);
+const norm = a => { const l = vlen(a) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+function rotAround(v, k, a) {
+  const c = Math.cos(a), s = Math.sin(a), d = k[0]*v[0]+k[1]*v[1]+k[2]*v[2], kx = cross(k, v);
+  return [0,1,2].map(i => v[i]*c + kx[i]*s + k[i]*d*(1-c));
+}
+function bez(c, t) {
+  const u = 1-t, a = u*u*u, b = 3*u*u*t, d = 3*u*t*t, e = t*t*t;
+  return [0,1,2].map(i => a*c[0][i] + b*c[1][i] + d*c[2][i] + e*c[3][i]);
+}
+function bezD(c, t) {
+  const u = 1-t, a = 3*u*u, b = 6*u*t, d = 3*t*t;
+  return [0,1,2].map(i => a*(c[1][i]-c[0][i]) + b*(c[2][i]-c[1][i]) + d*(c[3][i]-c[2][i]));
+}
+function frame(n) {
+  const r = Math.abs(n[1]) < .9 ? [0,1,0] : [1,0,0];
+  const e1 = norm(cross(n, r)); return [e1, cross(n, e1)];
+}
+// 横向参数：偏重边缘和中脉，让轮廓更清晰
+function edgeV(e = .32, m = .08) {
+  const k = R();
+  if (k < e) return (R() < .5 ? -1 : 1) * rnd(.93, 1);
+  if (k < e + m) return rnd(-.04, .04);
+  return R()*2 - 1;
+}
+
+// ================= 形体采样器 =================
+function tube(c, r0, r1 = r0, o = {}) {
+  return () => {
+    let t = R(), cap = false;
+    if (o.cap && R() < o.cap) { t = 1; cap = true; }
+    const P = bez(c, t), T = norm(bezD(c, t)), [e1, e2] = frame(T);
+    let th = R()*TAU, r = r0 + (r1-r0)*t;
+    if (o.ribs) {
+      const step = TAU / o.ribs;
+      if (R() < .55) th = Math.round(th/step)*step;
+      r *= 1 + .11*Math.cos(o.ribs*th);
+      if (R() < .07) r *= 1.2; // 刺
+    }
+    const ct = Math.cos(th), st = Math.sin(th);
+    if (cap) {
+      const ph = Math.acos(R()), s = Math.sin(ph)*r, h = Math.cos(ph)*r;
+      return [0,1,2].map(i => P[i] + (e1[i]*ct + e2[i]*st)*s + T[i]*h);
+    }
+    return [0,1,2].map(i => P[i] + (e1[i]*ct + e2[i]*st)*r);
+  };
+}
+const defWf = u => Math.pow(Math.sin(Math.PI*Math.pow(u, .7)), .8);
+function leaf(o) {
+  const d = o.dir ? norm(o.dir) : [Math.cos(o.pitch)*Math.cos(o.yaw), Math.sin(o.pitch), Math.cos(o.pitch)*Math.sin(o.yaw)];
+  let side = cross(d, o.plane || [0,1,0]);
+  side = vlen(side) < 1e-3 ? [1,0,0] : norm(side);
+  let n = cross(side, d);
+  if (o.roll) { side = rotAround(side, d, o.roll); n = rotAround(n, d, o.roll); }
+  const L = o.len, W = o.width, wf = o.wf || defWf, dr = o.droop || 0, cup = o.cup || 0, back = o.back || 0, rej = o.reject, b = o.base;
+  return () => {
+    let u, v, k = 0;
+    if (o.outline && R() < o.outlineP) [u, v] = o.outline(); // 额外的轮廓线（如裂口边缘）
+    else do { u = R(); v = edgeV(o.edge); } while (rej && rej(u, v) && ++k < 40);
+    const w = W*wf(u), a = (u-back)*L, c = cup*v*v*w, dy = -dr*u*u*L;
+    return [b[0]+d[0]*a+side[0]*v*w+n[0]*c, b[1]+d[1]*a+side[1]*v*w+n[1]*c+dy, b[2]+d[2]*a+side[2]*v*w+n[2]*c];
+  };
+}
+function blob(c, r) {
+  return () => { const th = R()*TAU, ph = Math.acos(R()*2-1);
+    return [c[0]+Math.sin(ph)*Math.cos(th)*r, c[1]+Math.cos(ph)*r, c[2]+Math.sin(ph)*Math.sin(th)*r]; };
+}
+
+// ================= 植物 =================
+// 马蹄莲佛焰苞：底部包成细管 → 漏斗 → 正面外翻的花口，背面拉长成卷曲尖端
+// b 为花底，ax 为花轴，back 为尖端所在一侧，Lf 为长度，s 为花口半径
+function spathe(P, b, ax, back, Lf, s, open = true) {
+  const d = back[0]*ax[0] + back[1]*ax[1] + back[2]*ax[2];
+  const e2 = norm([back[0]-ax[0]*d, back[1]-ax[1]*d, back[2]-ax[2]*d]), e1 = cross(ax, e2);
+  const at = (h, th, r) => [0,1,2].map(i => b[i] + ax[i]*h + (e2[i]*Math.cos(th) + e1[i]*Math.sin(th))*r);
+  P.push([Lf*s*2.6*(open ? 1 : .6), () => {
+    const t = R() < .3 ? rnd(.92, 1) : Math.pow(R(), .8);
+    const cov = TAU*(open ? 1 - .38*t*t : 1 - .08*t);
+    const th = R() < .12 ? (R() < .5 ? -1 : 1)*cov/2*.98 : rnd(-cov/2, cov/2);
+    const front = Math.abs(th)/Math.PI, flare = open ? Math.max(0, t - .7)/.3 : 0;
+    const r = s*(.06 + .94*Math.pow(t, 1.5)) + s*.45*flare*flare*front;
+    const h = t*Lf + Lf*.45*Math.pow(t, 3)*Math.pow(Math.max(0, 1 - front*1.6), 2) - Lf*.14*flare*flare*front;
+    return at(h, th, r);
+  }]);
+  // 卷曲的尖端
+  const P0 = at(Lf*1.45, 0, s);
+  const tipC = [P0, at(Lf*1.55, 0, s*1.25), at(Lf*1.5, 0, s*1.6), at(Lf*1.3, 0, s*1.7)];
+  P.push([.006, tube(tipC, .007, .002)]);
+  // 肉穗花序
+  if (open) P.push([.012, tube([at(Lf*.1, 0, 0), at(Lf*.3, 0, s*.05), at(Lf*.5, 0, s*.08), at(Lf*.68, 0, s*.1)], .022, .012, {cap:.1})]);
+}
+
+function callaLily() {
+  const P = [];
+  // 左下的宽叶
+  P.push([.12, leaf({base:[-.42,-1,.05], dir:[-.18,1,.1], plane:[0,0,1], roll:.3, len:.75, width:.17, droop:.08, cup:.35})]);
+  // 细长花葶 + 佛焰苞
+  const flowers = [
+    {root:[-.3,-1,0],   b:[-.22,.32,0],   ax:[.25,1,.05], back:[-1,0,.1],  Lf:.5, s:.27},
+    {root:[-.2,-1,.03], b:[.08,.0,.06],   ax:[-.1,.8,.6], back:[1,.2,-.3], Lf:.44, s:.26},
+    {root:[-.12,-1,.05],b:[.16,-.4,.1],   ax:[.15,1,.45], back:[1,-.2,0],  Lf:.44, s:.26},
+    {root:[-.15,-1,0],  b:[.02,-.5,-.02], ax:[.05,1,0],   back:[-1,0,0],   Lf:.36, s:.09, open:false},
+  ];
+  for (const f of flowers) {
+    const ax = norm(f.ax), r = f.root, b = f.b;
+    P.push([.035*(b[1]-r[1]), tube([r, [r[0], r[1]+(b[1]-r[1])*.45, r[2]], [b[0]-ax[0]*.3, b[1]-ax[1]*.3, b[2]-ax[2]*.3], b], .016, .013)]);
+    spathe(P, b, ax, f.back, f.Lf, f.s, f.open !== false);
+  }
+  return P;
+}
+
+// 铃铛花：圆顶 → 筒身 → 6 片外翻尖裂片。c 为花顶，ax 为开口朝向
+function bell(c, ax, s, lip = 1) {
+  const [e1, e2] = frame(ax);
+  return () => {
+    const th = R()*TAU, ct = Math.cos(th), st = Math.sin(th);
+    const p = R() < .25*lip ? rnd(.93, 1) : R()*(lip ? 1 : .8);
+    let r, h;
+    if (p < .35) { const ph = p/.35*Math.PI/2; r = s*Math.sin(ph)*.95; h = s*.55*(1-Math.cos(ph)); }
+    else if (p < .75) { const k = (p-.35)/.4; r = s*(.95 - .05*Math.sin(Math.PI*k)); h = s*(.55 + .6*k); }
+    else {
+      const k = (p-.75)/.25, lobe = Math.pow(Math.abs(Math.cos(3*th)), 2);
+      r = s*(.92 + .08*k*k + .12*k*lobe*lip);
+      h = s*(1.15 + .2*k - .06*lobe*k*k*lip);
+    }
+    r *= 1 + .04*Math.cos(6*th);
+    return [0,1,2].map(i => c[i] + ax[i]*h + (e1[i]*ct + e2[i]*st)*r);
+  };
+}
+
+function lilyOfTheValley() {
+  const P = [], stem = [[.12,-1,0],[.17,-.35,0],[.04,.25,0],[-.08,.72,.02]];
+  P.push([.05, tube(stem, .014, .008)]);
+  // 沿花序轴左右交替、挂在弯曲小花梗上的下垂铃铛
+  const n = 9;
+  for (let i = 0; i < n; i++) {
+    const t = .22 + i*.078, a = bez(stem, t), sg = i % 2 ? 1 : -1;
+    const az = rnd(-.5, .5), out = norm([sg*Math.cos(az), 0, Math.sin(az)]);
+    const L = .17 - t*.06, s = .115 - t*.04;
+    const m1 = [a[0]+out[0]*L*.4, a[1]+.07, a[2]+out[2]*L*.4];
+    const m2 = [a[0]+out[0]*L*.85, a[1]+.07, a[2]+out[2]*L*.85];
+    const top = [a[0]+out[0]*L, a[1]-.01, a[2]+out[2]*L];
+    P.push([.008, tube([a, m1, m2, top], .005)]);
+    P.push([s*s*8, bell(top, norm([out[0]*.3, -1, out[2]*.3]), s)]);
+  }
+  // 顶端将开的花
+  const tip = bez(stem, 1);
+  P.push([.04, bell([tip[0]-.02, tip[1]+.02, tip[2]], norm([.5, -.6, .3]), .075, .6)]);
+  // 宽披针形大叶，从底部向左上方斜伸；后面一片窄叶包着花茎
+  const lw = u => Math.pow(Math.sin(Math.PI*Math.pow(u, .9)), .7);
+  P.push([.3, leaf({base:[.14,-1,.06], dir:[-.42,1,.05], plane:[0,0,1], roll:.35, len:1.25, width:.14, droop:.2, cup:.45, wf:lw})]);
+  P.push([.1, leaf({base:[.16,-1,-.04], dir:[.12,1,-.08], plane:[0,0,1], roll:-.6, len:.8, width:.08, droop:.05, cup:.6, wf:lw})]);
+  return P;
+}
+
+function staghorn() {
+  const P = [];
+  // 背后的树皮板
+  P.push([.1, () => {
+    const y = rnd(-1, .3), hw = .2 + .05*Math.sin(y*7) + .03*Math.sin(y*19);
+    let x = R() < .3 ? (R() < .5 ? -hw : hw) : rnd(-hw, hw);
+    if (R() < .3) x = Math.round(x/.07)*.07; // 竖向裂纹
+    return [x, y, -.14 + rnd(-.02, .02)];
+  }]);
+  // 圆形贝壳状盾叶，放射脉纹，贴在树皮上
+  const shield = (c, rad, o, w) => P.push([w, () => {
+    let a = R()*TAU, r; const k = R();
+    if (k < .3) r = rnd(.95, 1);
+    else if (k < .6) { a = Math.round(a/(TAU/16))*(TAU/16); r = Math.sqrt(R()); }
+    else r = Math.sqrt(R());
+    // 脉纹从偏上方的“生长点”发散
+    const x = Math.cos(a)*r*rad + o[0]*(1-r), y = Math.sin(a)*r*rad*1.05 + o[1]*(1-r);
+    return [c[0]+x, c[1]+y, c[2] + .12*rad*(1-r*r) - .05*r];
+  }]);
+  shield([.05, -.5, .0], .3, [-.1, .2], .14);
+  shield([-.22, -.2, .04], .19, [.1, -.05], .07);
+  // 向上扇形展开、多次分叉的鹿角状孢子叶
+  const segs = [];
+  function grow(p, d, len, w0, w1, depth) {
+    const q = [p[0]+d[0]*len, p[1]+d[1]*len, p[2]+d[2]*len];
+    let side = cross(d, [0,0,1]); side = vlen(side) < .1 ? [1,0,0] : norm(side);
+    side = rotAround(side, d, rnd(-.4, .4));
+    const n = norm(cross(side, d));
+    segs.push({p, q, side, n, w0, w1, L:len});
+    if (!depth) return;
+    const spread = rnd(.32, .5);
+    for (const sg of [-1, 1]) {
+      const nd = norm(rotAround(d, n, sg*spread*rnd(.8, 1.2)));
+      const last = depth === 1;
+      grow(q, nd, len*rnd(.55, .75)*(last ? .9 : 1), w1*.62, last ? .006 : w1*.55, depth-1);
+    }
+  }
+  const B = [-.02, -.38, .1];
+  for (const deg of [-62, -40, -18, 2, 22, 44, 62]) {
+    const a = (deg + rnd(-6, 6))*Math.PI/180, z = rnd(-.35, .35);
+    const d = norm([Math.sin(a), Math.cos(a), z]);
+    const L = rnd(.62, .78)*(1 - Math.abs(deg)/250);
+    // 细长叶柄 → 逐渐变宽的叶片 → 两到三次分叉
+    grow(B, d, L*.55, .025, .09, 0);
+    const q = [B[0]+d[0]*L*.55, B[1]+d[1]*L*.55, B[2]+d[2]*L*.55];
+    grow(q, d, L*.25, .09, .13, R() < .5 ? 2 : 3);
+  }
+  let tot = 0; for (const s of segs) tot += s.L*(s.w0+s.w1);
+  for (const s of segs) P.push([.62*s.L*(s.w0+s.w1)/tot, () => {
+    const t = R(), v = edgeV(.35, .1), w = (s.w0 + (s.w1-s.w0)*t)*.5;
+    return [0,1,2].map(i => s.p[i] + (s.q[i]-s.p[i])*t + s.side[i]*v*w + s.n[i]*v*v*w*.3);
+  }]);
+  return P;
+}
+
+function sunflower() {
+  const P = [];
+  // 单根直茎
+  P.push([.08, tube([[.06,-1,0],[.07,-.5,0],[.05,0,.02],[.03,.3,.04]], .026, .02)]);
+  // 两片带长叶柄的叶子：左下、右上
+  const heart = u => Math.pow(Math.sin(Math.PI*Math.pow(u, .55)), .65);
+  const lp = norm([0, 1, .7]);
+  P.push([.012, tube([[.06,-.62,0],[0,-.55,.04],[-.12,-.5,.06],[-.2,-.5,.06]], .009)]);
+  P.push([.08, leaf({base:[-.2,-.5,.06], dir:[-1,-.05,.15], plane:lp, len:.44, width:.13, droop:.12, cup:.25, wf:heart})]);
+  P.push([.012, tube([[.07,-.3,0],[.12,-.25,.02],[.2,-.12,.03],[.25,-.07,.03]], .009)]);
+  P.push([.07, leaf({base:[.25,-.07,.03], dir:[1,.25,.1], plane:lp, len:.38, width:.11, droop:.15, cup:.25, wf:heart})]);
+  // 花盘朝前微侧
+  const C = [-.02,.55,.1], nr = norm([-.18,.12,1]), [e1, e2] = frame(nr);
+  const at = (r, a, h) => [0,1,2].map(i => C[i] + e1[i]*Math.cos(a)*r + e2[i]*Math.sin(a)*r + nr[i]*h);
+  P.push([.34, () => { // 斐波那契种子盘
+    const M = 800, i = Math.floor(R()*M), r = .2*Math.sqrt((i+.5)/M);
+    return at(r, i*2.39996, .05*(1-(r/.2)**2));
+  }]);
+  // 舌状花瓣：长短、角度不一
+  const nP = 28, pet = [];
+  for (let k = 0; k < nP; k++) pet.push({a: k*TAU/nP + rnd(-.06,.06), L: rnd(.2, .29), w: rnd(.06, .085), layer: k % 2, tw: rnd(-.04, .04)});
+  P.push([.36, () => {
+    const p = pet[Math.floor(R()*nP)];
+    const u = R(), v = edgeV(.35, .05), r = .18 + u*p.L;
+    const w = p.w*Math.pow(Math.sin(Math.PI*Math.pow(u, .55)), .8);
+    return at(r, p.a + v*w/r + p.tw*u, -(.02 + p.layer*.04)*u*u + .015*v*v - .015*u);
+  }]);
+  return P;
+}
+
+function monstera() {
+  const P = [];
+  // 宽心形叶：叶柄接在心形缺口处，两侧基部裂片向后包
+  const wf = u => Math.pow(Math.sin(Math.PI*(.06 + .94*u)), .45)*(1 - .12*u);
+  // 裂口沿弯向叶尖的侧脉，从叶缘深切到中脉附近；中脉两旁一排椭圆孔洞
+  const veins = [.1,.21,.32,.43,.54,.65,.76];
+  const veinU = (s, av) => s + .3*av + .1*av*av;
+  const deepOf = s => s > .6 ? .45 : .24, gap = av => .01 + .022*av;
+  const holes = [];
+  for (let k = 1; k < veins.length - 2; k++) holes.push((veinU(veins[k], .15) + veinU(veins[k+1], .15))/2);
+  const reject = (u, v) => {
+    const av = Math.abs(v);
+    if (u < .1 && av < .22*(1 - u/.1)) return true; // 心形缺口
+    for (const s of veins) if (av > deepOf(s) && Math.abs(u - veinU(s, av)) < gap(av)) return true;
+    for (const uc of holes) if (((u - uc - .25*(av - .15))/.022)**2 + ((av - .15)/.1)**2 < 1) return true;
+    return false;
+  };
+  // 裂口和孔洞的边缘描线
+  const outline = () => {
+    const sd = R() < .5 ? -1 : 1;
+    if (R() < .25) { const uc = holes[Math.floor(R()*holes.length)], t = R()*TAU; const dv = Math.sin(t)*.104; return [uc + .25*dv + Math.cos(t)*.025, sd*(.15 + dv)]; }
+    let s, av, u;
+    do { s = veins[Math.floor(R()*veins.length)]; av = rnd(deepOf(s), .98); u = veinU(s, av) + (R() < .5 ? -1 : 1)*(gap(av) + .004); } while (u > .98);
+    return [u, sd*av];
+  };
+  // 叶片层叠：attach 为叶柄末端，dir 为中脉方向
+  const defs = [
+    {b:[-.15,.85,0],   dir:[-.75,-.5,.1],  L:.8,  roll:.2},
+    {b:[.12,.68,-.12], dir:[.25,-1,.15],   L:.7,  roll:-.15},
+    {b:[-.45,.05,.08], dir:[-.6,-.6,.2],   L:.7,  roll:.3},
+    {b:[.2,.25,.18],   dir:[.7,.4,.35],    L:.36, roll:-.9, curl:true},
+    {b:[.42,-.1,.06],  dir:[.75,.15,.15],  L:.62, roll:-.25},
+    {b:[-.05,-.32,.22],dir:[.6,-.6,.3],    L:.55, roll:.45},
+  ];
+  for (const d of defs) {
+    const b = d.b, r0 = [rnd(-.08,.08), -1, rnd(-.06,.06)];
+    // 细长叶柄从底部一束伸出，略带弧度
+    P.push([.018*(b[1]+1), tube([r0, [r0[0] + (b[0]-r0[0])*.2, r0[1] + (b[1]-r0[1])*.5, r0[2]], [b[0] - d.dir[0]*.05, b[1] - .15, b[2]], b], .012, .009)]);
+    P.push([.2*d.L*d.L, leaf({base:b, dir:d.dir, plane:[0,0,1], roll:d.roll + rnd(-.15,.15),
+      len:d.L, width:d.L*.5, back:.15, droop:d.curl ? -.25 : .1, cup:d.curl ? .5 : .12, wf, ...(d.L > .36 ? {reject, outline, outlineP: .42} : {})})]);
+  }
+  return P;
+}
+
+// 仙人掌扁茎节：上宽下窄的扁椭球 + 成簇放射状的刺
+// c 中心，ang 倾斜角（正值向左倾），L/W/T 半长/半宽/半厚，yaw 绕自身轴的转角
+function pad(P, c, ang, L, W, T, yaw = 0, taper = 1) {
+  const a = ang*Math.PI/180, up = [-Math.sin(a), Math.cos(a), 0];
+  const nr = rotAround([0,0,1], up, yaw), side = cross(up, nr);
+  const at = (u, v, h) => [0,1,2].map(i => c[i] + up[i]*u*L + side[i]*v*W + nr[i]*h*T);
+  // 掌状轮廓：基部收窄、上部饱满，边缘带轻微起伏
+  const ph = R()*TAU;
+  const wAt = (u, th) => (1 - .5*taper + .5*taper*Math.pow((u + 1)/2, .6))*(1 + .05*Math.sin(th*5 + ph) + .03*Math.sin(th*9 + ph*2));
+  P.push([L*W*1.6, () => {
+    const th = R()*TAU, rim = R() < .35;
+    const z = rim ? rnd(-.15, .15) : (R() < .5 ? -1 : 1)*Math.sqrt(R());
+    const rr = Math.sqrt(1 - z*z), u = Math.sin(th)*rr, v = Math.cos(th)*rr;
+    return at(u, v*wAt(u, th), z*(.6 + .4*Math.sqrt(Math.max(0, 1 - u*u))));
+  }]);
+  // 刺座：两面交错排布，每个刺座放射出 4–6 根固定方向的刺，形成星状簇
+  const ar = [];
+  const addAr = (u, v, sd) => {
+    const h = sd*Math.sqrt(Math.max(0, 1 - u*u - v*v))*.9, base = at(u, v, h);
+    const out = norm(at(u*1.6, v*1.6, (sd || 0)*1.2).map((x, i) => x - c[i]));
+    const spines = [];
+    for (let k = 0, n = 4 + Math.floor(R()*3); k < n; k++)
+      spines.push([norm(out.map((x, i) => x + rnd(-.8, .8)*side[i] + rnd(-.8, .8)*up[i] + sd*.6*nr[i])), rnd(.07, .13)]);
+    ar.push({base, spines});
+  };
+  for (let i = -3; i <= 3; i++) for (let j = -2; j <= 2; j++) {
+    const u = i/3.6 + (j % 2 ? .07 : 0), v = j/2.6*wAt(u, 0);
+    if (u*u + v*v < .85) for (const sd of [-1, 1]) addAr(u, v, sd);
+  }
+  for (let k = 0; k < 12; k++) { const t = k/12*TAU, u = Math.sin(t)*.97; addAr(u, Math.cos(t)*.97*wAt(u, t), 0); } // 边缘刺座
+  P.push([L*W*.85, () => {
+    const a = ar[Math.floor(R()*ar.length)];
+    if (R() < .2) return a.base.map(x => x + rnd(-.008, .008)); // 刺座本身
+    const [d, len] = a.spines[Math.floor(R()*a.spines.length)], l = R()*len;
+    return [a.base[0]+d[0]*l, a.base[1]+d[1]*l, a.base[2]+d[2]*l];
+  }]);
+}
+
+function pricklyPear() {
+  const P = [];
+  pad(P, [0,-.6,0], 0, .38, .25, .1, 0, .1);       // 底部宽厚的主茎节（不收窄）
+  pad(P, [-.02,.25,0], 3, .52, .26, .07, .1);      // 中央高大的扁茎节
+  pad(P, [-.42,-.02,.03], 22, .47, .21, .065, -.3); // 左侧斜伸，基部接在主茎节左上
+  pad(P, [-.67,.44,.02], 30, .09, .065, .045);      // 左侧茎节尖上的小芽
+  pad(P, [.38,.02,.04], -40, .35, .19, .06, .35);   // 右侧中部
+  pad(P, [.42,-.6,.05], -62, .27, .16, .06, .25);   // 右侧下部
+  pad(P, [-.62,-.86,.08], 0, .08, .07, .06);        // 左下独立的小芽
+  // 右上：细长子房 + 杯状黄花
+  P.push([.05, tube([[.2,.12,.03],[.27,.27,.04],[.33,.42,.05],[.38,.55,.05]], .05, .075, {cap:.1})]);
+  P.push([.16, fullRose([.42,.64,.05], norm([.35,1,.3]), .23)]);
+  // 地面阴影线
+  P.push([.02, () => { const x = rnd(-.45, .75); return [x, -.99 + R()*.01, rnd(-.12, .12)*(1 - Math.abs(x - .15))]; }]);
+  return P;
+}
+
+// 在局部坐标系 (e1,e2,n) 中把 [x,y,h] 变到世界坐标
+const toWorld = (C, e1, e2, n, x, y, h) => [0,1,2].map(i => C[i] + e1[i]*x + e2[i]*y + n[i]*h);
+
+// 重瓣杯状花：外层花瓣外翻，中层直立成杯，花心螺旋包卷
+function fullRose(C, nr, Rd) {
+  const [e1, e2] = frame(nr);
+  const layers = [
+    {n:5, rIn:.18, rOut:1, lift:.3, hw:.85, fall:.35, curl:.12},
+    {n:6, rIn:.15, rOut:.86, lift:.5, hw:.72, fall:.12, curl:.12},
+    {n:7, rIn:.12, rOut:.7, lift:.62, hw:.62, fall:0, curl:.1},
+    {n:7, rIn:.1, rOut:.54, lift:.62, hw:.56, fall:0, curl:.08},
+  ];
+  const pets = [];
+  layers.forEach((L, li) => { for (let k = 0; k < L.n; k++) pets.push({...L, a: k*TAU/L.n + li*.45 + rnd(-.15,.15), ph: R()*TAU, w: L.rOut*L.hw}); });
+  let tot = 0; for (const p of pets) tot += p.w;
+  const heart = budRose(toWorld(C, e1, e2, nr, 0, 0, .18*Rd), nr, Rd*.5); // 螺旋花心
+  return () => {
+    if (R() < .2) return heart();
+    let x = R()*tot, p = pets[0]; for (const q of pets) { x -= q.w; if (x <= 0) { p = q; break; } }
+    const u = R() < .3 ? rnd(.9, 1) : R(), v = edgeV(.28, 0);
+    const ws = Math.sin(Math.PI*(.18 + .72*u));
+    const th = p.a + v*p.hw*ws;
+    const rim = Math.max(0, u - .8)/.2; // 花瓣边缘向外翻卷
+    const r = ((p.rIn + (p.rOut - p.rIn)*Math.pow(u, .8)) + p.curl*rim*rim)*Rd*(1 + .04*Math.sin(v*4 + p.ph));
+    const h = (p.lift*Math.sin(Math.PI*.5*u) - p.fall*u*u*u - p.curl*rim*rim*.6 + .04*Math.sin(v*5 + p.ph)*u*u)*Rd;
+    return toWorld(C, e1, e2, nr, Math.cos(th)*r, Math.sin(th)*r, h);
+  };
+}
+// 包卷的花苞：螺旋叠瓣
+function budRose(C, nr, Rd) {
+  const [e1, e2] = frame(nr), n = 10;
+  return () => {
+    const i = Math.floor(R()*n), f = i/(n-1), a = i*2.39996;
+    const r0 = (.15 + .85*f)*Rd*.55, hgt = (1 - .25*f)*Rd*.9, spread = .6 + .5*f;
+    const u = R(), v = edgeV(.3, 0);
+    const th = a + v*spread*(1 - .2*u*u), rad = r0*(.6 + .4*Math.sin(Math.PI*.5*u)) + f*.25*Rd*u*u*u;
+    return toWorld(C, e1, e2, nr, Math.cos(th)*rad, Math.sin(th)*rad, u*hgt - f*.1*Rd*u*u*u);
+  };
+}
+const serrated = u => defWf(u)*(.88 + .12*Math.abs(Math.sin(u*Math.PI*9)));
+// 奇数羽状复叶
+function compoundLeaf(P, b, dir, sz) {
+  const d = norm(dir), lp = norm([0,.6,1]);
+  const tip = [b[0]+d[0]*.24*sz, b[1]+d[1]*.24*sz, b[2]+d[2]*.24*sz];
+  P.push([.008, tube([b, b, tip, tip], .005)]);
+  P.push([.04*sz, leaf({base:tip, dir:d, plane:lp, len:.2*sz, width:.08*sz, droop:.03, cup:.3, wf:serrated})]);
+  for (const t of [.45, .85]) {
+    const p = [b[0]+d[0]*.24*sz*t, b[1]+d[1]*.24*sz*t, b[2]+d[2]*.24*sz*t];
+    for (const sg of [-1, 1]) {
+      const sd = norm(rotAround(d, lp, sg*1.0));
+      P.push([.03*sz, leaf({base:p, dir:sd, plane:lp, len:.15*sz, width:.065*sz, droop:.03, cup:.3, wf:serrated})]);
+    }
+  }
+}
+function chineseRose() {
+  const P = [];
+  // 一根主茎由下往上，顶端托着右上的大花
+  const stem = [[.05,-1,0],[.02,-.55,0],[.1,-.1,.02],[.2,.38,.04]];
+  P.push([.05, tube(stem, .016, .012)]);
+  // 右上大花、左下大花（重瓣杯状，朝前微仰）
+  const A = {C:[.26,.5,.08], n:norm([.15,1,.75]), R:.36};
+  const B = {C:[-.34,.0,.12], n:norm([-.2,1,.8]), R:.34};
+  P.push([.48, fullRose(A.C, A.n, A.R)]);
+  const jB = bez(stem, .55), eB = [B.C[0]-B.n[0]*.08, B.C[1]-B.n[1]*.08-.05, B.C[2]-B.n[2]*.08];
+  P.push([.012, tube([jB, [jB[0]-.05, jB[1]+.03, jB[2]], [eB[0]+.1, eB[1]-.05, eB[2]], eB], .01)]);
+  P.push([.45, fullRose(B.C, B.n, B.R)]);
+  // 左上细长花苞，带萼片
+  const jC = bez(stem, .85), bud = [-.2,.86,.02], ba = norm([-.15,1,.05]);
+  P.push([.015, tube([jC, [jC[0]-.05, jC[1]+.15, jC[2]], [bud[0]+.03, bud[1]-.2, bud[2]], [bud[0], bud[1]-.1, bud[2]]], .007)]);
+  P.push([.05, () => { // 花苞：上尖下圆
+    const a = R()*TAU, t = R(), r = .055*Math.pow(Math.sin(Math.PI*(.08 + .85*t)), .8)*(1 - .4*t), [b1, b2] = frame(ba);
+    return [0,1,2].map(i => bud[i] + ba[i]*(t - .55)*.2 + (b1[i]*Math.cos(a) + b2[i]*Math.sin(a))*r);
+  }]);
+  for (let k = 0; k < 5; k++) { // 萼片：细长、向外弯
+    const a = k*TAU/5, d = norm([Math.cos(a)*.8, .55, Math.sin(a)*.8]);
+    P.push([.004, leaf({base:[bud[0], bud[1]-.1, bud[2]], dir:d, len:.12, width:.012, droop:.12})]);
+  }
+  // 茎上互生的锯齿复叶
+  compoundLeaf(P, bez(stem, .7), [1,.25,.15], 1.2);
+  compoundLeaf(P, bez(stem, .45), [1,-.05,.2], 1.25);
+  compoundLeaf(P, bez(stem, .3), [-1,.15,.2], 1.25);
+  compoundLeaf(P, bez(stem, .6), [-.5,-.7,.4], .9);
+  // 茎上的小刺
+  P.push([.006, () => { const t = rnd(.05, .9), p = bez(stem, t), a = R()*TAU, l = R()*.025;
+    return [p[0] + Math.cos(a)*(.016 + l), p[1] + l*.5, p[2] + Math.sin(a)*(.016 + l)]; }]);
+  return P;
+}
+
+function dandelion() {
+  const P = [];
+  const B = [0,-.88,0];
+  // 放射状叶丛：倒向羽裂的锯齿叶
+  const runc = u => {
+    const env = Math.pow(Math.sin(Math.PI*Math.pow(u, .75)), .7);
+    return u > .8 ? env : env*(.3 + .7*Math.pow((u*5.5) % 1, 1.6));
+  };
+  const lp = norm([0,.5,1]);
+  for (let i = 0; i < 9; i++) {
+    P.push([.045, leaf({base:B, yaw:i*TAU/9 + rnd(-.2,.2), pitch:rnd(.1, .75), plane:lp, len:rnd(.5, .75), width:.085, droop:.15, cup:.1, wf:runc, edge:.4})]);
+  }
+  // 中空的花葶
+  const stalk = (top, w) => P.push([w, tube([B, [B[0], B[1]+.3, B[2]], [top[0]*.6, top[1]-.25, top[2]], top], .009)]);
+  // 绒球
+  const G = [-.12,.82,0], dirs = [], M = 140;
+  for (let i = 0; i < M; i++) {
+    const y = 1 - 2*(i+.5)/M, r = Math.sqrt(1-y*y), a = i*2.39996;
+    if (y > -.55) dirs.push([Math.cos(a)*r, y, Math.sin(a)*r]);
+  }
+  const seed = (c, d, L) => () => {
+    if (R() < .3) { const t = rnd(.08, 1)*L; return [c[0]+d[0]*t, c[1]+d[1]*t, c[2]+d[2]*t]; }
+    const tip = [c[0]+d[0]*L, c[1]+d[1]*L, c[2]+d[2]*L], [e1, e2] = frame(d);
+    const a = Math.floor(R()*10)/10*TAU + rnd(-.04,.04), l = R()*.05;
+    return [0,1,2].map(i => tip[i] + (e1[i]*Math.cos(a) + e2[i]*Math.sin(a))*l + d[i]*l*.5);
+  };
+  stalk([G[0], G[1]-.04, G[2]], .04);
+  P.push([.3, () => seed(G, dirs[Math.floor(R()*dirs.length)], .17)()]);
+  P.push([.02, blob(G, .03)]);
+  for (let i = 0; i < 8; i++) P.push([.003, leaf({base:[G[0],G[1]-.02,G[2]], yaw:i*TAU/8, pitch:-1.1, len:.07, width:.008})]);
+  // 黄色头状花：密集的舌状小花
+  const F = [.2,.48,.06], fn = norm([.15,.45,1]), [f1, f2] = frame(fn);
+  stalk([F[0]-fn[0]*.04, F[1]-fn[1]*.04, F[2]-fn[2]*.04], .035);
+  P.push([.16, () => {
+    const a = Math.floor(R()*48)/48*TAU + rnd(-.02,.02), r = (.03 + .14*Math.sqrt(R()))*(.75 + .25*R());
+    return toWorld(F, f1, f2, fn, Math.cos(a)*r, Math.sin(a)*r, .04*(1 - r/.17) - .01);
+  }]);
+  P.push([.02, () => { const a = R()*TAU, t = R(), r = .05*(1-t*.3);
+    return toWorld(F, f1, f2, fn, Math.cos(a)*r, Math.sin(a)*r, -.02 - t*.06); }]);
+  // 半开的花与花苞
+  const bud = (top, ax, s, open) => {
+    stalk([top[0]-ax[0]*s*1.4, top[1]-ax[1]*s*1.4, top[2]-ax[2]*s*1.4], .02);
+    const [b1, b2] = frame(ax);
+    P.push([.035*s/.06, () => {
+      const a = R()*TAU, t = R();
+      let r = s*.55*Math.sin(Math.PI*(.15 + .75*t)), h = (t - 1)*s*1.4;
+      if (open && t > .7) r *= 1 + (t-.7)*2.5;
+      if (R() < .2) { const k = R(); r = s*.55*(1 + k*.8); h = -s*1.3 + k*s*.3 - k*k*s*.8; } // 外翻的总苞片
+      return [0,1,2].map(i => top[i] + ax[i]*h + (b1[i]*Math.cos(a) + b2[i]*Math.sin(a))*r);
+    }]);
+  };
+  bud([0,.3,.08], norm([-.05,1,.1]), .07, true);
+  bud([-.48,.02,.05], norm([-.35,1,.1]), .07, false);
+  bud([-.2,-.28,.1], norm([-.1,1,.2]), .045, false);
+  // 被风带走的几颗种子
+  for (const [c, d] of [[[.25,.98,.05], norm([.3,1,.1])], [[.42,1.08,-.08], norm([.5,1,-.2])]])
+    P.push([.006, seed(c, d, .06)]);
+  return P;
+}
+
+const PLANTS = [
+  {zh:'马蹄莲', latin:'Zantedeschia aethiopica', make:callaLily},
+  {zh:'铃兰', latin:'Convallaria majalis', make:lilyOfTheValley},
+  {zh:'鹿角蕨', latin:'Platycerium bifurcatum', make:staghorn},
+  {zh:'向日葵', latin:'Helianthus annuus', make:sunflower},
+  {zh:'龟背竹', latin:'Monstera deliciosa', make:monstera, fraction:.93},
+  {zh:'仙人掌', latin:'Opuntia ficus-indica', make:pricklyPear},
+  {zh:'月季', latin:'Rosa chinensis', make:chineseRose, fraction:.93},
+  {zh:'蒲公英', latin:'Taraxacum officinale', make:dandelion},
+];
+
+// 按权重采样 K 个点，并归一化到 [-1,1] 的高度范围
+function samplePlant(parts, K) {
+  let tot = 0; for (const p of parts) tot += p[0];
+  const cum = []; let acc = 0; for (const p of parts) { acc += p[0]/tot; cum.push(acc); }
+  const out = new Float32Array(K*3);
+  let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9, z0 = 1e9, z1 = -1e9;
+  for (let i = 0; i < K; i++) {
+    const r = R(); let j = 0; while (j < cum.length-1 && cum[j] < r) j++;
+    const q = parts[j][1]();
+    out[i*3] = q[0]; out[i*3+1] = q[1]; out[i*3+2] = q[2];
+    x0 = Math.min(x0, q[0]); x1 = Math.max(x1, q[0]);
+    y0 = Math.min(y0, q[1]); y1 = Math.max(y1, q[1]);
+    z0 = Math.min(z0, q[2]); z1 = Math.max(z1, q[2]);
+  }
+  const mx = (x0+x1)/2, my = (y0+y1)/2, mz = (z0+z1)/2;
+  let wr = 0;
+  for (let i = 0; i < K; i++) wr = Math.max(wr, Math.hypot(out[i*3]-mx, out[i*3+2]-mz));
+  const s = Math.min(1.9/(y1-y0), 1.2/wr);
+  for (let i = 0; i < K; i++) {
+    out[i*3] = (out[i*3]-mx)*s; out[i*3+1] = (out[i*3+1]-my)*s; out[i*3+2] = (out[i*3+2]-mz)*s;
+  }
+  return out;
+}
+
+// ================= Perlin 噪声 & 风场 =================
+const perm = new Uint8Array(512);
+{ const p = [...Array(256).keys()];
+  for (let i = 255; i > 0; i--) { const j = Math.floor(R()*(i+1)); [p[i], p[j]] = [p[j], p[i]]; }
+  for (let i = 0; i < 512; i++) perm[i] = p[i & 255]; }
+const fade = t => t*t*t*(t*(t*6-15)+10), lerp = (t, a, b) => a + t*(b-a);
+function grad(h, x, y, z) { h &= 15; const u = h < 8 ? x : y, v = h < 4 ? y : (h === 12 || h === 14) ? x : z;
+  return ((h & 1) ? -u : u) + ((h & 2) ? -v : v); }
+function noise(x, y, z) {
+  let X = Math.floor(x), Y = Math.floor(y), Z = Math.floor(z);
+  x -= X; y -= Y; z -= Z; X &= 255; Y &= 255; Z &= 255;
+  const u = fade(x), v = fade(y), w = fade(z);
+  const A = perm[X]+Y, AA = perm[A]+Z, AB = perm[A+1]+Z, B = perm[X+1]+Y, BA = perm[B]+Z, BB = perm[B+1]+Z;
+  return lerp(w,
+    lerp(v, lerp(u, grad(perm[AA], x, y, z), grad(perm[BA], x-1, y, z)),
+            lerp(u, grad(perm[AB], x, y-1, z), grad(perm[BB], x-1, y-1, z))),
+    lerp(v, lerp(u, grad(perm[AA+1], x, y, z-1), grad(perm[BA+1], x-1, y, z-1)),
+            lerp(u, grad(perm[AB+1], x, y-1, z-1), grad(perm[BB+1], x-1, y-1, z-1))));
+}
+let time = 0, WX = 0, WY = 0, NT = 0;
+const pot = (a, b) => noise(a, b, NT) + .45*noise(a*2.3+17.1, b*2.3+3.7, NT*1.7);
+function wind(x, y) { // curl noise：无散度，像风一样卷动而不堆积
+  const a = x*NOISE_SCALE, b = y*NOISE_SCALE, e = .015;
+  const dy = (pot(a, b+e) - pot(a, b-e))/(2*e), dx = (pot(a+e, b) - pot(a-e, b))/(2*e);
+  WX = dy*WIND_AMP + .25*Math.cos(time*.07);
+  WY = -dx*WIND_AMP + .1*Math.sin(time*.05);
+}
+
+// ================= 画布与粒子 =================
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W, H, DPR, cx, cy, Rx, Ry, S;
+function resize() {
+  DPR = Math.min(2, devicePixelRatio || 1); W = innerWidth; H = innerHeight;
+  cv.width = W*DPR; cv.height = H*DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  cx = W/2; cy = H*.45; S = Math.min(W*.3, H*.32);
+  Rx = Math.min(W*.47, S*2.1); Ry = Math.min(H*.44, S*1.5);
+}
+resize(); addEventListener('resize', resize);
+
+const N = clamp(Math.round(W*H/290), 2200, 5500);
+const px = new Float32Array(N), py = new Float32Array(N), vx = new Float32Array(N), vy = new Float32Array(N);
+const dx = new Float32Array(N), dy = new Float32Array(N), pdx = new Float32Array(N), pdy = new Float32Array(N);
+const zf = new Float32Array(N), dep = new Float32Array(N), spd = new Float32Array(N);
+const tx = new Float32Array(N), ty = new Float32Array(N), tz = new Float32Array(N);
+const tg = new Int32Array(N), dl = new Float32Array(N), sd = new Float32Array(N);
+const mem = new Uint8Array(N), rel = new Uint8Array(N);
+function spawn(i) {
+  const a = R()*TAU, r = Math.sqrt(R())*.95;
+  px[i] = cx + Math.cos(a)*r*Rx; py[i] = cy + Math.sin(a)*r*Ry;
+}
+for (let i = 0; i < N; i++) {
+  spawn(i); dx[i] = pdx[i] = px[i]; dy[i] = pdy[i] = py[i];
+  zf[i] = Math.pow(R(), 1.5)*.75; dep[i] = zf[i]; spd[i] = rnd(.6, 1.4);
+}
+
+// ================= 状态机 =================
+let phase = 0, pt = .4, cur = null, ry0 = 0, rotT = 0;
+const nameEl = document.getElementById('name');
+function startForm() {
+  const def = PLANTS[plantI]; plantI = (plantI + 1) % PLANTS.length;
+  const K = Math.round(N*(def.fraction || PLANT_FRACTION)), loc = samplePlant(def.make(), K);
+  const idx = [...Array(N).keys()];
+  for (let i = N-1; i > 0; i--) { const j = Math.floor(R()*(i+1)); [idx[i], idx[j]] = [idx[j], idx[i]]; }
+  const members = idx.slice(0, K);
+  ry0 = -(DUR[1] + Math.min(DUR[2], 2)/2)*ROT_SPEED + rnd(-.15, .15); rotT = 0; // 维持阶段中点正好转到正面
+  // 按极角排序配对，粒子从相近方向汇入，避免交叉乱飞
+  const ca = Math.cos(ry0), sa = Math.sin(ry0);
+  const tAng = [...Array(K).keys()].map(k => [Math.atan2(-loc[k*3+1], loc[k*3]*ca + loc[k*3+2]*sa), k]).sort((a, b) => a[0]-b[0]);
+  const pAng = members.map(i => [Math.atan2(py[i]-cy, px[i]-cx), i]).sort((a, b) => a[0]-b[0]);
+  mem.fill(0); rel.fill(0);
+  for (let k = 0; k < K; k++) { const i = pAng[k][1]; tg[i] = tAng[k][1]; mem[i] = 1; dl[i] = R()*.3; }
+  cur = {loc, members};
+  document.getElementById('zh').textContent = def.zh;
+  document.getElementById('latin').textContent = def.latin;
+  nameEl.classList.add('show');
+}
+function prepScatter() {
+  const g = rnd(-.5, .3) + (R() < .5 ? 0 : Math.PI), gc = Math.cos(g), gs = Math.sin(g);
+  let lo = 1e9, hi = -1e9;
+  for (const i of cur.members) { const p = (tx[i]-cx)*gc + (ty[i]-cy)*gs; sd[i] = p; lo = Math.min(lo, p); hi = Math.max(hi, p); }
+  // 迎风一侧最先被吹散
+  for (const i of cur.members) sd[i] = .5*(1 - (sd[i]-lo)/(hi-lo || 1)) + R()*.15;
+  cur.gx = gc; cur.gy = gs;
+  nameEl.classList.remove('show');
+}
+function release(i) {
+  rel[i] = 1; px[i] = tx[i]; py[i] = ty[i];
+  wind(px[i], py[i]);
+  const g = rnd(.5, 1.2);
+  vx[i] = WX*.3 + cur.gx*g + rnd(-.6, .6);
+  vy[i] = WY*.3 + cur.gy*g + rnd(-.6, .6);
+}
+function projectAll() {
+  const a = ry0 + rotT*ROT_SPEED, ca = Math.cos(a), sa = Math.sin(a), cr = Math.cos(TILT), sr = Math.sin(TILT);
+  const sw = Math.sin(time*1.7)*.035, sw2 = Math.cos(time*1.1)*.02, loc = cur.loc;
+  for (const i of cur.members) {
+    const k = tg[i]*3, Y = loc[k+1], hh = (Y+1)*.5;
+    const X = loc[k] + sw*hh*hh, Z = loc[k+2] + sw2*hh*hh;
+    const x1 = X*ca + Z*sa, z1 = -X*sa + Z*ca;
+    const y2 = Y*cr - z1*sr, z2 = Y*sr + z1*cr;
+    const p = CAM/(CAM - z2);
+    tx[i] = cx + x1*p*S; ty[i] = cy - y2*p*S; tz[i] = clamp(.5 + z2*.45, 0, 1);
+  }
+}
+// 调试：?plant=序号 指定起始植物，?hold 让植物一直定格
+const QS = new URLSearchParams(location.search);
+let plantI = QS.has('plant') ? +QS.get('plant') % PLANTS.length : PLANTS.findIndex(p => p.zh === '鹿角蕨'); // 起始植物：鹿角蕨
+if (QS.has('hold')) DUR[2] = 1e9;
+
+function stepFree(i, f) {
+  wind(px[i], py[i]);
+  const s = spd[i], k = .045*f;
+  vx[i] += (WX*s - vx[i])*k; vy[i] += (WY*s - vy[i])*k;
+  const ex = (px[i]-cx)/Rx, ey = (py[i]-cy)/Ry, d2 = ex*ex + ey*ey;
+  if (d2 > .7) {
+    const d = Math.sqrt(d2);
+    if (d > 1.7) { spawn(i); vx[i] = vy[i] = 0; return; }
+    const c = (d - .84)*.35*f;
+    if (c > 0) { vx[i] -= ex/d*c; vy[i] -= ey/d*c; }
+  }
+  px[i] += vx[i]*f; py[i] += vy[i]*f;
+}
+const ease = t => t < .5 ? 4*t*t*t : 1 - Math.pow(-2*t+2, 3)/2;
+
+// ================= 加载进度（可接入真实进度） =================
+let realProgress = null, fakeProgress = 0;
+window.plantLoader = { setProgress(p) { realProgress = clamp(p, 0, 1); } };
+const barEl = document.getElementById('bar'), statusEl = document.getElementById('status');
+let lastShown = -1;
+
+// ================= 主循环 =================
+const NB = 7;
+let last = performance.now();
+function tick(now) {
+  const dt = Math.min(.05, (now - last)/1000); last = now;
+  time += dt; pt += dt; NT = time*.12;
+  const f = dt*60;
+
+  if (phase === 0 && pt >= DUR[0]) { phase = 1; pt = 0; startForm(); }
+  else if (phase === 1 && pt >= DUR[1]) { phase = 2; pt = 0; }
+  else if (phase === 2 && pt >= DUR[2]) { phase = 3; pt = 0; prepScatter(); }
+  else if (phase === 3 && pt >= DUR[3]) {
+    for (const i of cur.members) if (!rel[i]) release(i);
+    phase = 0; pt = 0; cur = null; mem.fill(0);
+  }
+  if (cur) { rotT += dt; projectAll(); }
+  if (phase === 3) { const u = pt/DUR[3]; for (const i of cur.members) if (!rel[i] && u >= sd[i]) release(i); }
+
+  const formU = phase === 1 ? pt/DUR[1] : 0;
+  for (let i = 0; i < N; i++) {
+    pdx[i] = dx[i]; pdy[i] = dy[i];
+    const m = mem[i];
+    if (!m || (phase === 3 && rel[i])) {
+      stepFree(i, f);
+      dx[i] = px[i]; dy[i] = py[i];
+      dep[i] += (zf[i] - dep[i])*Math.min(1, .03*f);
+    } else if (phase === 1) {
+      stepFree(i, f);
+      const e = ease(clamp((formU - dl[i])/.7, 0, 1));
+      dx[i] = px[i] + (tx[i]-px[i])*e; dy[i] = py[i] + (ty[i]-py[i])*e;
+      dep[i] = zf[i] + (tz[i]-zf[i])*e;
+    } else {
+      dx[i] = tx[i]; dy[i] = ty[i]; dep[i] = tz[i];
+    }
+  }
+
+  // 绘制：按深度分桶，近处更大更黑，远处更小更淡
+  ctx.clearRect(0, 0, W, H);
+  const paths = Array.from({length: NB}, () => new Path2D());
+  for (let i = 0; i < N; i++) {
+    const ex = (dx[i]-cx)/Rx, ey = (dy[i]-cy)/Ry, d = Math.sqrt(ex*ex + ey*ey);
+    const fd = clamp((1.12 - d)/.35, 0, 1);
+    const lv = (.15 + .85*dep[i])*fd;
+    if (lv < .03) continue;
+    const b = Math.min(NB-1, Math.floor(lv*NB));
+    let mx = dx[i]-pdx[i], my = dy[i]-pdy[i];
+    const ml = Math.hypot(mx, my);
+    if (ml > 7) { mx *= 7/ml; my *= 7/ml; }
+    paths[b].moveTo(dx[i] - mx*2, dy[i] - my*2);
+    paths[b].lineTo(dx[i] + .01, dy[i]);
+  }
+  ctx.lineCap = 'round';
+  for (let b = 0; b < NB; b++) {
+    ctx.lineWidth = .6 + b*.32;
+    ctx.strokeStyle = `rgba(22,21,18,${(.12 + b*.13).toFixed(2)})`;
+    ctx.stroke(paths[b]);
+  }
+
+  fakeProgress += (0.995 - fakeProgress)*dt*.08;
+  const prog = Math.round((realProgress ?? fakeProgress)*100);
+  if (prog !== lastShown) { lastShown = prog; barEl.style.width = prog + '%'; statusEl.textContent = 'LOADING ' + prog + '%'; }
+
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
