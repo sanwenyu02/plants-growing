@@ -6,7 +6,7 @@
 <title>Plant Loading</title>
 <style>
   :root { --ink: #161512; --muted: #8b8679; }
-  html, body { margin: 0; height: 100%; overflow: hidden; }
+  html, body { margin: 0; height: 100%; overflow: hidden; user-select: none; -webkit-user-select: none; }
   body {
     background: radial-gradient(ellipse at 50% 45%, #f8f6f0 0%, #f1eee6 55%, #e4dfd2 100%);
     color: var(--ink);
@@ -678,10 +678,50 @@ const QS = new URLSearchParams(location.search);
 let plantI = QS.has('plant') ? +QS.get('plant') % PLANTS.length : PLANTS.findIndex(p => p.zh === '鹿角蕨'); // 起始植物：鹿角蕨
 if (QS.has('hold')) DUR[2] = 1e9;
 
-function stepFree(i, f) {
+// ================= 鼠标交互 =================
+const MOUSE_R = 150;     // 鼠标影响半径（像素），按高斯衰减
+const MOUSE_FOLLOW = .16; // 范围内粒子速度向鼠标速度靠拢的强度
+let mx = -1e4, my = -1e4, mvx = 0, mvy = 0, lastPT = 0;
+addEventListener('pointermove', e => {
+  const now = performance.now(), dtm = Math.max(8, now - lastPT);
+  if (lastPT && now - lastPT < 100) {
+    // 换算成“每帧像素”，并做平滑，避免抖动
+    const k = 16.7/dtm;
+    mvx = mvx*.5 + (e.clientX - mx)*k*.5; mvy = mvy*.5 + (e.clientY - my)*k*.5;
+    const sp = Math.hypot(mvx, mvy); if (sp > 30) { mvx *= 30/sp; mvy *= 30/sp; }
+  }
+  mx = e.clientX; my = e.clientY; lastPT = now;
+});
+addEventListener('pointerleave', () => { mx = my = -1e4; mvx = mvy = 0; });
+// 双击：植物粒子从当前位置快速炸开，恢复自由流动并跟随鼠标
+addEventListener('dblclick', () => {
+  if (!cur) return;
+  let ox = 0, oy = 0; for (const i of cur.members) { ox += dx[i]; oy += dy[i]; }
+  ox /= cur.members.length; oy /= cur.members.length;
+  for (const i of cur.members) {
+    if (phase === 3 && rel[i]) continue;
+    rel[i] = 1; px[i] = dx[i]; py[i] = dy[i];
+    const ax = dx[i] - ox, ay = dy[i] - oy, d = Math.hypot(ax, ay) || 1, g = rnd(5, 11)*(.5 + .5*Math.min(1, d/S));
+    vx[i] = ax/d*g + rnd(-1.5, 1.5); vy[i] = ay/d*g + rnd(-1.5, 1.5);
+  }
+  phase = 0; pt = -1; cur = null; mem.fill(0); // 多给 1 秒自由时间再组成下一株
+  nameEl.classList.remove('show');
+});
+
+function stepFree(i, f, mouse = true) {
   wind(px[i], py[i]);
   const s = spd[i], k = .045*f;
   vx[i] += (WX*s - vx[i])*k; vy[i] += (WY*s - vy[i])*k;
+  if (mouse) {
+    const ax = px[i] - mx, ay = py[i] - my, w = Math.exp(-(ax*ax + ay*ay)/(MOUSE_R*MOUSE_R));
+    if (w > .01) {
+      // 速度柔和地向鼠标滑动速度靠拢，并被轻轻吸向鼠标轨迹
+      const sp = Math.min(Math.hypot(mvx, mvy), 20), d = Math.hypot(ax, ay) || 1;
+      const m = Math.min(1, w*MOUSE_FOLLOW*f*spd[i]*Math.min(1, sp/3)); // 鼠标静止时不拖拽
+      vx[i] += (mvx*1.1 - vx[i])*m - ax/d*w*sp*.012*f;
+      vy[i] += (mvy*1.1 - vy[i])*m - ay/d*w*sp*.012*f;
+    }
+  }
   const ex = (px[i]-cx)/Rx, ey = (py[i]-cy)/Ry, d2 = ex*ex + ey*ey;
   if (d2 > .7) {
     const d = Math.sqrt(d2);
@@ -706,6 +746,7 @@ function tick(now) {
   const dt = Math.min(.05, (now - last)/1000); last = now;
   time += dt; pt += dt; NT = time*.12;
   const f = dt*60;
+  const decay = Math.pow(.88, f); mvx *= decay; mvy *= decay; // 鼠标停下后影响逐渐消失
 
   if (phase === 0 && pt >= DUR[0]) { phase = 1; pt = 0; startForm(); }
   else if (phase === 1 && pt >= DUR[1]) { phase = 2; pt = 0; }
@@ -726,7 +767,7 @@ function tick(now) {
       dx[i] = px[i]; dy[i] = py[i];
       dep[i] += (zf[i] - dep[i])*Math.min(1, .03*f);
     } else if (phase === 1) {
-      stepFree(i, f);
+      stepFree(i, f, false); // 聚合中的粒子脱离鼠标影响
       const e = ease(clamp((formU - dl[i])/.7, 0, 1));
       dx[i] = px[i] + (tx[i]-px[i])*e; dy[i] = py[i] + (ty[i]-py[i])*e;
       dep[i] = zf[i] + (tz[i]-zf[i])*e;
